@@ -1,94 +1,93 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
 from gradio_client import Client, handle_file
-import os
-import tempfile
-import logging
+from huggingface_hub import HfApi
 import time
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+SPACE_ID = "lixin4ever/VideoLLaMA3"
 
-app = FastAPI()
+def wait_for_gpu():
+    print("🔍 Checking GPU status...")
+    api = HfApi()
+    while True:
+        info = api.get_space_runtime(SPACE_ID)
+        stage = info.stage
+        print(f"ℹ️ Space status: {stage}")
+        if stage == "RUNNING":
+            print("✅ GPU is available. Proceeding...\n")
+            break
+        elif stage in {"BUILDING", "WAITING", "SLEEPING", "PAUSED"}:
+            print("⏳ Waiting for GPU to become available...")
+            time.sleep(5)
+        else:
+            raise RuntimeError(f"Unexpected space state: {stage}")
 
-# Configure CORS to allow Netlify frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://incandescent-beijinho-b4545d.netlify.app"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Step 1: Wait for GPU
+wait_for_gpu()
+
+# Step 2: Init client
+client = Client(SPACE_ID)
+print(f"Loaded as API: {client.src} ✔")
+
+# Step 3: Upload video
+video_url = "https://github.com/gradio-app/gradio/raw/main/demo/video_component/files/world.mp4"
+print("▶️ Uploading video...")
+video_path = handle_file(video_url)
+upload_result = client.predict(
+    messages=[],
+    video={"video": video_path},
+    api_name="/_on_video_upload"
+)
+print(f"✅ Uploaded: {upload_result}")
+
+# Step 4: Prepare message
+video_message = {
+    "role": "user",
+    "content": [
+        {
+            "type": "video",
+            "video": {
+                "video_path": video_path,
+                "fps": 1,
+                "max_frames": 180
+            }
+        },
+        "Summarize the video"
+    ]
+}
+
+# Step 5: Submit inference job
+print("▶️ Asking question...")
+response = client.predict(
+    messages=[video_message],
+    input_text="Summarize the video",
+    do_sample=True,
+    temperature=0.2,
+    top_p=0.9,
+    max_new_tokens=512,
+    fps=1,
+    max_frames=180,
+    api_name="/_predict"
 )
 
-# Initialize Gradio Client with retry
-def initialize_client(max_retries=3, retry_delay=5):
-    for attempt in range(max_retries):
-        try:
-            client = Client("lixin4ever/VideoLLaMA3", hf_token=os.getenv("HF_TOKEN"))
-            logger.info("Successfully initialized Gradio Client")
-            return client
-        except Exception as e:
-            logger.error(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-    raise Exception("Failed to initialize Gradio Client after retries")
+print("\n=== ✅ Final Response ===")
+for msg in response:
+    print(f"{msg['role'].upper()}: {msg['content']}")
 
-client = initialize_client()
 
-@app.post("/process-media")
-async def process_media(file: UploadFile = File(...), query: str = Form(...)):
-    try:
-        # Validate file format
-        if not file.filename.endswith((".mp4", ".png", ".jpg", ".jpeg")):
-            return {"error": "Unsupported file format. Use .mp4, .png, .jpg, or .jpeg"}
+print("\n=== 🔄 Streaming Response ===")
+start = time.time()
+chunk_count = 0
+try:
+    for response in job:
+        chunk_count += 1
+        print(f"🟢 Chunk #{chunk_count}")
+        print("➡️ Raw:", response)
 
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp_file:
-            tmp_file.write(await file.read())
-            tmp_file_path = tmp_file.name
-
-        # Step 1: Upload media (video or image)
-        messages = []
-        endpoint = "/_on_video_upload" if file.filename.endswith(".mp4") else "/_on_image_upload"
-        media_param = (
-            {"video": handle_file(tmp_file_path)} if endpoint == "/_on_video_upload"
-            else {"path": handle_file(tmp_file_path)}
-        )
-        result = client.predict(
-            messages=messages,
-            **{endpoint.split("_")[-2]: media_param},
-            api_name=endpoint
-        )
-        messages = result[0]
-
-        # Step 2: Add text query
-        result = client.predict(
-            messages=messages,
-            text=query,
-            api_name="/_on_text_submit"
-        )
-        messages = result[0]
-
-        # Step 3: Generate response
-        result = client.predict(
-            messages=messages,
-            input_text="",
-            do_sample=True,
-            temperature=0.2,
-            top_p=0.9,
-            max_new_tokens=2048,
-            fps=1.0,
-            max_frames=180,
-            api_name="/_predict"
-        )
-        response = result[-1]["content"] if result else "No response generated"
-
-        # Clean up temporary file
-        os.unlink(tmp_file_path)
-        return {"response": response}
-    except Exception as e:
-        if os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
-        logger.error(f"Error processing media: {str(e)}")
-        return {"error": str(e)}
+        if isinstance(response, list):
+            for msg in response:
+                print(f"🔹 {msg['role'].upper()}: {msg['content']}")
+        else:
+            print("🔸", response)
+except Exception as e:
+    print("❌ Error occurred during streaming:", e)
+finally:
+    print(f"⏱️ Total time waited: {round(time.time() - start, 2)} seconds")
