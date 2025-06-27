@@ -3,20 +3,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from gradio_client import Client, handle_file
 import os
 import tempfile
+import logging
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 # Configure CORS to allow Netlify frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://incandescent-beijinho-b4545d.netlify.app"],  # Replace with your Netlify domain
+    allow_origins=["https://incandescent-beijinho-b4545d.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Gradio Client
-client = Client("lixin4ever/VideoLLaMA3", hf_token=os.getenv("HF_TOKEN"))
+# Initialize Gradio Client with retry
+def initialize_client(max_retries=3, retry_delay=5):
+    for attempt in range(max_retries):
+        try:
+            client = Client("lixin4ever/VideoLLaMA3", hf_token=os.getenv("HF_TOKEN"))
+            logger.info("Successfully initialized Gradio Client")
+            return client
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+    raise Exception("Failed to initialize Gradio Client after retries")
+
+client = initialize_client()
 
 @app.post("/process-media")
 async def process_media(file: UploadFile = File(...), query: str = Form(...)):
@@ -39,7 +57,7 @@ async def process_media(file: UploadFile = File(...), query: str = Form(...)):
         )
         result = client.predict(
             messages=messages,
-            **{endpoint.split("_")[-2]: media_param},  # video or image
+            **{endpoint.split("_")[-2]: media_param},
             api_name=endpoint
         )
         messages = result[0]
@@ -72,4 +90,5 @@ async def process_media(file: UploadFile = File(...), query: str = Form(...)):
     except Exception as e:
         if os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
+        logger.error(f"Error processing media: {str(e)}")
         return {"error": str(e)}
